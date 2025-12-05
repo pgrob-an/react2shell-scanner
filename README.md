@@ -6,11 +6,21 @@ For technical details on the vulnerability and detection methodology, see our bl
 
 ## How It Works
 
-The scanner sends a crafted multipart POST request that triggers a specific error condition in vulnerable versions of React Server Components. Vulnerable hosts return a 500 status code with `E{"digest"` in the response body. This check differentiates vulnerable hosts from those that are simply running RSC.
+By default, the scanner sends a crafted multipart POST request containing an RCE proof-of-concept payload that executes a deterministic math operation (`41*271 = 11111`). Vulnerable hosts return the result in the `X-Action-Redirect` response header as `/login?a=11111`.
 
 The scanner tests the root path first. If not vulnerable, it follows same-host redirects (e.g., `/` to `/en/`) and tests the redirect destination. Cross-origin redirects are not followed.
 
-Hosts running on Vercel or Netlify are automatically filtered out as these platforms have deployed mitigations.
+### Safe Check Mode
+
+The `--safe-check` flag uses an alternative detection method that relies on side-channel indicators (500 status code with specific error digest) without executing code on the target. Use this mode when RCE execution is not desired.
+
+### WAF Bypass
+
+The `--waf-bypass` flag prepends random junk data to the multipart request body. This can help evade WAF content inspection that only analyzes the first portion of request bodies. The default size is 128KB, configurable via `--waf-bypass-size`. When WAF bypass is enabled, the timeout is automatically increased to 20 seconds (unless explicitly set).
+
+### Windows Mode
+
+The `--windows` flag switches the payload from Unix shell (`echo $((41*271))`) to PowerShell (`powershell -c "41*271"`) for targets running on Windows.
 
 ## Requirements
 
@@ -50,6 +60,24 @@ Scan with custom headers:
 python3 scanner.py -u https://example.com -H "Authorization: Bearer token" -H "Cookie: session=abc"
 ```
 
+Use safe side-channel detection:
+
+```
+python3 scanner.py -u https://example.com --safe-check
+```
+
+Scan Windows targets:
+
+```
+python3 scanner.py -u https://example.com --windows
+```
+
+Scan with WAF bypass:
+
+```
+python3 scanner.py -u https://example.com --waf-bypass
+```
+
 ## Options
 
 ```
@@ -64,6 +92,10 @@ python3 scanner.py -u https://example.com -H "Authorization: Bearer token" -H "C
 -v, --verbose     Show response details for vulnerable hosts
 -q, --quiet       Only output vulnerable hosts
 --no-color        Disable colored output
+--safe-check      Use safe side-channel detection instead of RCE PoC
+--windows         Use Windows PowerShell payload instead of Unix shell
+--waf-bypass      Add junk data to bypass WAF content inspection
+--waf-bypass-size Size of junk data in KB (default: 128)
 ```
 
 ## Output
